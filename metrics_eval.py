@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from typing import Tuple, Dict, List, Any
+import numpy as np
 
 from torch.utils.data import DataLoader
 
@@ -24,7 +25,11 @@ from dataloader import (
     close_all_datasets,
 )
 from dataloader import _infer_variable_name
-from physics_rewards import reward_massconservation
+from physics_rewards import (
+    reward_massconservation,
+    reward_momentumconservation,
+    reward_energyconservation,
+)
 
 
 def get_loaders(
@@ -152,6 +157,9 @@ def main():
     parser.add_argument('--persistent-workers', action='store_true', help='Enable persistent_workers (requires num_workers>0)')
     parser.add_argument('--eval-mass', action='store_true', help='Evaluate reward_massconservation per trajectory for (t, t+1) over selected split')
     parser.add_argument('--split', type=str, default='train', choices=['train', 'val', 'test', 'all'], help='Which split to evaluate for reward metrics')
+    parser.add_argument('--eval-all', action='store_true', help='Evaluate mass, momentum, energy for trajectories with full T and save as (3,Ntraj,20) numpy array')
+    parser.add_argument('--require-T', type=int, default=21, help='Only include trajectories from files with exactly this many timesteps (default: 21)')
+    parser.add_argument('--save-npy', type=str, default=None, help='Path to save the (3,Ntraj,20) numpy file (optional)')
 
     args = parser.parse_args()
 
@@ -182,6 +190,23 @@ def main():
         for r in results['results']:
             print(f"traj {r['traj_index']}: mean={r['mean_reward']:.6f} (pairs={len(r['rewards'])})")
 
+    if args.eval_all:
+        arr, meta = evaluate_conservation_rewards_numpy(
+            data_path=args.path,
+            which_split=args.split,
+            splits=tuple(args.splits),
+            n_trajs=args.n_trajs,
+            require_T=args.require_T,
+        )
+        print(f"\nAll conservation rewards array shape: {arr.shape} (expected (3, Ntraj, 20))")
+        print(f"Included trajectories: {meta['n_traj_included']} | pairs per traj: {meta['pairs_per_traj']}")
+        out_path = args.save_npy
+        if out_path is None:
+            # default file name based on split
+            out_path = f"conservation_rewards_{args.split}.npy"
+        np.save(out_path, arr)
+        print(f"Saved numpy array to: {out_path}")
+
     # Ensure cleanup of open NetCDF files in loaders
     close_all_datasets(train_loader.dataset)
     close_all_datasets(val_loader.dataset)
@@ -190,3 +215,99 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def evaluate_conservation_rewards_numpy(
+    data_path: str,
+    *,
+    which_split: str = 'train',
+    splits: Tuple[float, float, float] = (0.7, 0.2, 0.1),
+    n_trajs: int | None = None,
+    require_T: int = 21,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Evaluate mass, momentum, and energy conservation rewards for qualifying trajectories
+    and return a numpy array with shape (3, Ntraj, T-1). Only include trajectories from
+    datasets whose T equals 'require_T' (default 21), yielding T-1=20 time pairs.
+
+    Returns:
+        (arr, meta) where arr has shape (3, Ntraj, T-1) ordered as [mass, momentum, energy]
+        and meta contains basic metadata such as counts and indices.
+    """
+    var_name = _infer_variable_name(data_path)
+    ds = NetCDFTrajectoryDataset(data_path, variable_name=var_name)
+
+    try:
+        # Filter by required T
+        if getattr(ds, 'T', None) != require_T:
+            # No trajectories included if the file doesn't match requirement
+            empty = np.zeros((3, 0, max(0, require_T - 1)), dtype=np.float32)
+            return empty, {
+                'split': which_split,
+                'pairs_per_traj': require_T - 1,
+                'n_traj_included': 0,
+                'reason': f"Dataset T={ds.T} does not match require_T={require_T}",
+            }
+
+        N_traj = ds.N
+        T_pairs = ds.n_samples_per_traj  # should be require_T - 1
+
+        # Determine split ranges by trajectory index
+        n_train = int(splits[0] * N_traj)
+        n_val = int(splits[1] * N_traj)
+        if which_split == 'train':
+            start, end = 0, n_train
+        elif which_split == 'val':
+            start, end = n_train, n_train + n_val
+        elif which_split == 'test':
+            start, end = n_train + n_val, N_traj
+        elif which_split == 'all':
+            start, end = 0, N_traj
+        else:
+            raise ValueError(f"Invalid which_split: {which_split}")
+
+        if n_trajs is not None:
+            end = min(end, start + max(0, n_trajs))
+
+        mass_all: List[List[float]] = []
+        mom_all: List[List[float]] = []
+        en_all: List[List[float]] = []
+        included_indices: List[int] = []
+
+        for traj_idx in range(start, end):
+            base = traj_idx * T_pairs
+            mass_vals: List[float] = []
+            mom_vals: List[float] = []
+            en_vals: List[float] = []
+            for t in range(T_pairs):
+                idx = base + t
+                x, y = ds[idx]
+                r_mass = reward_massconservation(x, y)
+                r_mom = reward_momentumconservation(x, y)
+                r_en = reward_energyconservation(y, x)  # note reversed args
+                mass_vals.append(float(r_mass.item()))
+                mom_vals.append(float(r_mom.item()))
+                en_vals.append(float(r_en.item()))
+
+            mass_all.append(mass_vals)
+            mom_all.append(mom_vals)
+            en_all.append(en_vals)
+            included_indices.append(traj_idx)
+
+        if len(included_indices) == 0:
+            arr = np.zeros((3, 0, T_pairs), dtype=np.float32)
+        else:
+            arr = np.stack([
+                np.array(mass_all, dtype=np.float32),
+                np.array(mom_all, dtype=np.float32),
+                np.array(en_all, dtype=np.float32),
+            ], axis=0)  # (3, Ntraj, T_pairs)
+
+        meta: Dict[str, Any] = {
+            'split': which_split,
+            'pairs_per_traj': T_pairs,
+            'n_traj_included': len(included_indices),
+            'traj_indices': included_indices,
+        }
+        return arr, meta
+    finally:
+        ds.close()
