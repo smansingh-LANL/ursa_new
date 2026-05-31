@@ -266,20 +266,21 @@ def plot_conservation_histograms(
     if arr.ndim != 3 or arr.shape[0] != 3:
         raise ValueError(f"Expected arr shape (3, Ntraj, T-1); got {arr.shape}")
 
-    labels = [
-        ("Mass Conservation", "P(x)"),
-        ("Momentum Conservation", "P(x)"),
-        ("Energy Conservation", "P(x)"),
+    names = [
+        "Mass Conservation",
+        "Momentum Conservation",
+        "Energy Conservation",
     ]
 
     fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
 
     for i, ax in enumerate(axes):
         data = arr[i].reshape(-1)  # flatten across trajectories and time pairs
+        data = np.abs(data)        # histogram over absolute values as requested
         ax.hist(data, bins=bins, density=density, alpha=0.8, color='#1f77b4', edgecolor='black')
-        ax.set_xlabel(labels[i][0])
-        ax.set_ylabel(labels[i][1])
-        ax.set_title(labels[i][0])
+        ax.set_xlabel(f"x = {names[i]}")
+        ax.set_ylabel("P(x)")
+        ax.set_title(names[i])
 
     if save_path is not None:
         plt.savefig(save_path, dpi=150)
