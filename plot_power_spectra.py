@@ -80,16 +80,20 @@ def plot_power_spectra_over_time(
     save_path: str | None = None,
     show: bool = True,
     title: str = "Radial Power Spectra over Time",
+    k_scale: str = "normalized",
+    grid_size: int = 128,
 ) -> None:
     """
     Plot all timesteps' spectra on the same axes, colored red->blue as time increases.
 
     Args:
-        arr_T_nb: (T, nbins)
+        arr_T_nb: (T, nbins) or (C, T, nbins) aggregated spectra
         rmax: radial max used during binning (default 0.5)
         save_path: file path to save the figure (e.g., .png)
         show: whether to display the figure interactively
         title: plot title
+        k_scale: 'normalized' | 'angular' | 'mode' (rescales x-axis only)
+        grid_size: grid size N used when k_scale == 'mode'
     """
     import matplotlib.pyplot as plt
 
@@ -99,40 +103,51 @@ def plot_power_spectra_over_time(
         titles = [title]
     elif arr_T_nb.ndim == 3:
         # Multi-channel aggregated case: (C, T, nbins)
-        arr_list = [arr_T_nb[c] for c in range(arr_T_nb.shape[0])]
-        titles = [f"{title} (ch={c})" for c in range(arr_T_nb.shape[0])]
+        C = arr_T_nb.shape[0]
+        arr_list = [arr_T_nb[c] for c in range(C)]
+        ch_map = {0: "ρ", 1: "u_x", 2: "u_y", 3: "P", 4: "E"}
+        titles = [f"{title} ({ch_map.get(c, f'ch={c}')})" for c in range(C)]
     else:
         raise ValueError(f"Expected (T, nbins) or (C, T, nbins); got {arr_T_nb.shape}")
 
-    # Determine nbins from the first entry and build bin centers
+    # Determine nbins from the first entry and build normalized bin centers
     T0, nbins = arr_list[0].shape
     edges = np.linspace(0.0, rmax, nbins + 1, dtype=np.float32)
-    centers = 0.5 * (edges[:-1] + edges[1:])
+    centers = 0.5 * (edges[:-1] + edges[1:])  # normalized frequency units
+
+    # Rescale x-axis centers based on requested k-scale (spectra values remain unchanged)
+    if k_scale == "normalized":
+        x_label = "k (radial frequency)"
+        centers_plot = centers
+    elif k_scale == "angular":
+        centers_plot = centers * (2.0 * np.pi)
+        x_label = "k (angular wavenumber)"
+    elif k_scale == "mode":
+        centers_plot = centers * float(grid_size)
+        x_label = "k (mode number)"
+    else:
+        raise ValueError("k_scale must be one of: normalized, angular, mode")
 
     cmap = plt.get_cmap("RdYlBu")  # 0->blue, 1->red, so invert by (1 - frac)
-    eps = 1e-9
 
-    ncols = min(3, len(arr_list))
-    nrows = int(np.ceil(len(arr_list) / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6*ncols, 4*nrows), constrained_layout=True)
+    # All subplots in one row as requested
+    ncols = max(1, len(arr_list))
+    nrows = 1
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), constrained_layout=True)
     axes = np.atleast_1d(axes).reshape(nrows, ncols)
 
     idx = 0
-    for r in range(nrows):
-        for c in range(ncols):
-            if idx >= len(arr_list):
-                axes[r, c].axis('off')
-                continue
-            cur = arr_list[idx]
-            T = cur.shape[0]
-            for t in range(T):
-                frac = t / max(1, (T - 1))
-                color = cmap(1.0 - frac)  # t=0 -> red, t=T-1 -> blue
-                axes[r, c].plot(centers, cur[t], color=color, linewidth=1.25)
-            axes[r, c].set_xlabel("k (radial frequency)")
-            axes[r, c].set_ylabel("P(k)")
-            axes[r, c].set_title(titles[idx])
-            idx += 1
+    for c in range(ncols):
+        cur = arr_list[idx]
+        T = cur.shape[0]
+        for t in range(T):
+            frac = t / max(1, (T - 1))
+            color = cmap(1.0 - frac)  # t=0 -> red, t=T-1 -> blue
+            axes[0, c].plot(centers_plot, cur[t], color=color, linewidth=1.25)
+        axes[0, c].set_xlabel(x_label)
+        axes[0, c].set_ylabel("P(k)")
+        axes[0, c].set_title(titles[idx])
+        idx += 1
 
     if save_path is not None:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -142,10 +157,21 @@ def plot_power_spectra_over_time(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot aggregated radial power spectra over time.")
+    parser = argparse.ArgumentParser(description=(
+        "Plot aggregated radial power spectra over time. "
+        "Optionally rescale x-axis units without altering stored spectra: "
+        "--k-scale normalized|angular|mode (angular uses k=2πf; mode uses k=Nf)."
+    ))
     parser.add_argument("--path", required=True, help="Path to .npz or .npy file with (Ntraj, T, nbins) or (C, Ntraj, T, nbins)")
     parser.add_argument("--aggregate", choices=["mean", "median"], default="mean", help="Aggregation across trajectories (default: mean)")
     parser.add_argument("--rmax", type=float, default=0.5, help="Radial max used during binning (default: 0.5)")
+    parser.add_argument("--k-scale", choices=["normalized", "angular", "mode"], default="normalized",
+                        help=(
+                            "Rescale x-axis bin centers without modifying spectra values: "
+                            "'normalized' (k=f), 'angular' (k=2πf), 'mode' (k=Nf)."
+                        ))
+    parser.add_argument("--grid-size", type=int, default=128,
+                        help="Grid size N used only when --k-scale mode (k=Nf). Default: 128")
     parser.add_argument("--save-fig", type=str, default=None, help="If provided, save figure to this path (e.g., .png)")
     parser.add_argument("--no-show", action="store_true", help="Do not display the figure interactively")
     parser.add_argument("--title", type=str, default="Radial Power Spectra over Time", help="Figure title")
@@ -164,6 +190,8 @@ def main():
         save_path=args.save_fig,
         show=(not args.no_show),
         title=args.title,
+        k_scale=args.k_scale,
+        grid_size=args.grid_size,
     )
 
 
