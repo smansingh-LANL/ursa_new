@@ -18,7 +18,7 @@ from typing import Tuple, Dict, List, Any
 
 from torch.utils.data import DataLoader
 
-from .dataloader import (
+from dataloader import (
     get_train_val_test_splits,
     NetCDFTrajectoryDataset,
     close_all_datasets,
