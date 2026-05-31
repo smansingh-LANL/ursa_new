@@ -1,8 +1,9 @@
 import os
 import torch
-from torch.utils.data import Dataset, ConcatDataset, Subset
+from torch.utils.data import Dataset, ConcatDataset, Subset, DataLoader
 import netCDF4 as nc
 import numpy as np
+from typing import Optional, Tuple, List, Union
 
 
 class NetCDFTrajectoryDataset(Dataset):
@@ -129,9 +130,28 @@ class NetCDFPairsInTrajectoryDataset(Dataset):
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32), time_idx1, time_idx2
     
 
-def get_train_val_test_split_from_dir(data_dir, ds_type=NetCDFTrajectoryDataset, 
-                                      n_trajs_per_file=None, splits=[0.2, 0.7, 0.1],
-                                      file_names = None):
+def _infer_variable_name(file_name: str) -> str:
+    """Infer the NetCDF variable name based on common file-name patterns.
+
+    This harmonizes the logic across helpers in this module.
+    """
+    base = os.path.basename(file_name)
+    if "CE-RM" in base:
+        return "solution"
+    elif "FNS-KF" in base:
+        return "solution"
+    elif "NS-" in base:
+        return "velocity"
+    elif "Wave-Gauss" in base:
+        return "solution"
+    else:
+        return "data"
+
+def get_train_val_test_split_from_dir(data_dir,
+                                      ds_type=NetCDFTrajectoryDataset,
+                                      n_trajs_per_file: Optional[int] = None,
+                                      splits: List[float] = [0.2, 0.7, 0.1],
+                                      file_names: Optional[List[str]] = None):
     '''
     Copies what Arvind did for the train val test split, but for my lazy loaders
     '''
@@ -141,26 +161,27 @@ def get_train_val_test_split_from_dir(data_dir, ds_type=NetCDFTrajectoryDataset,
 
     for fname in file_names:
         file_path = os.path.join(data_dir, fname)
-        if "CE-RM.nc" in fname:
-            var_name = "solution"
-        if "NS-PwC.nc" in fname:
-            var_name = "velocity"
-        else:
-            var_name = "data"
+        var_name = _infer_variable_name(fname)
 
         ds = ds_type(file_path, var_name)
         n_samples_per_traj = ds.n_samples_per_traj
         if n_trajs_per_file is not None:
-            ds = Subset(ds, indices=range(n_trajs_per_file * n_samples_per_traj)) # get the first n_trajs
+            ds = Subset(ds, indices=range(n_trajs_per_file * n_samples_per_traj))  # first n_trajs
+            n_trajs_this_file = n_trajs_per_file
         else:
-            n_trajs_per_file = ds.N
+            n_trajs_this_file = ds.N
 
-        n_train = int(splits[0] * n_trajs_per_file) * n_samples_per_traj
-        n_val = int(splits[1] * n_trajs_per_file) * n_samples_per_traj
+        # compute counts per file (by trajectory) and convert to sample ranges
+        n_train_traj = int(splits[0] * n_trajs_this_file)
+        n_val_traj = int(splits[1] * n_trajs_this_file)
+        n_test_traj = max(0, n_trajs_this_file - n_train_traj - n_val_traj)
+
+        n_train = n_train_traj * n_samples_per_traj
+        n_val = n_val_traj * n_samples_per_traj
 
         train_set = Subset(ds, range(n_train))
         val_set = Subset(ds, range(n_train, n_train + n_val))
-        test_set = Subset(ds, range(n_train + n_val, len(ds)))
+        test_set = Subset(ds, range(n_train + n_val, n_train + n_val + n_test_traj * n_samples_per_traj))
 
         train_ds.append(train_set)
         val_ds.append(val_set)
@@ -171,9 +192,6 @@ def get_train_val_test_split_from_dir(data_dir, ds_type=NetCDFTrajectoryDataset,
     test_ds = ConcatDataset(datasets=test_ds)
 
     return train_ds, val_ds, test_ds
-
-import os
-from torch.utils.data import ConcatDataset
 
 def get_dataset_from_file(data_dir, file_name="NS-PwC.nc", ds_type=NetCDFTrajectoryDataset):
     """
@@ -188,18 +206,8 @@ def get_dataset_from_file(data_dir, file_name="NS-PwC.nc", ds_type=NetCDFTraject
         dataset: ConcatDataset containing the loaded dataset.
     """
     file_path = os.path.join(data_dir, file_name)
-
     # Set the correct variable name based on file name
-    if "CE-RM" in file_name:
-        var_name = "solution"
-    elif "FNS-KF" in file_name:
-        var_name = "solution"
-    elif "NS-" in file_name:
-        var_name = "velocity"
-    elif "Wave-Gauss" in file_name:
-        var_name = "solution"
-    else:
-        var_name = "data"
+    var_name = _infer_variable_name(file_name)
 
     print(f"Loading file: {file_path}")
     print(f"Using variable: {var_name}")
@@ -209,6 +217,84 @@ def get_dataset_from_file(data_dir, file_name="NS-PwC.nc", ds_type=NetCDFTraject
     # Wrap in ConcatDataset for consistency
     dataset = ConcatDataset([dataset])
     return dataset
+
+
+def get_train_val_test_splits(
+    data_path: str,
+    ds_type=NetCDFTrajectoryDataset,
+    splits: Tuple[float, float, float] = (0.7, 0.2, 0.1),
+    n_trajs_per_file: Optional[int] = None,
+    return_loaders: bool = True,
+    batch_size: int = 32,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+) -> Union[Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, torch.utils.data.Dataset],
+           Tuple[DataLoader, DataLoader, DataLoader]]:
+    """
+    Create train/val/test splits from a single NetCDF file path (or delegate to directory helper).
+
+    Args:
+        data_path: Path to a single .nc file or a directory. For a directory, delegates to
+                   get_train_val_test_split_from_dir using the provided ds_type and splits.
+        ds_type: Dataset class to wrap the NetCDF file (default: NetCDFTrajectoryDataset).
+        splits: Fractions for (train, val, test). Default is (0.7, 0.2, 0.1).
+        n_trajs_per_file: If provided, limit to the first N trajectories in the file.
+        return_loaders: If True (default), return PyTorch DataLoaders. If False, return Datasets.
+        batch_size: DataLoader batch size when return_loaders is True.
+        shuffle: Whether to shuffle the training DataLoader.
+        num_workers: DataLoader workers.
+        pin_memory: DataLoader pin_memory flag.
+        persistent_workers: DataLoader persistent_workers flag (only applies if num_workers > 0).
+
+    Returns:
+        - If return_loaders is False: (train_ds, val_ds, test_ds)
+        - If return_loaders is True: (train_loader, val_loader, test_loader)
+    """
+    if os.path.isdir(data_path):
+        # Delegate to the existing multi-file helper if a directory is passed.
+        train_ds, val_ds, test_ds = get_train_val_test_split_from_dir(
+            data_path, ds_type=ds_type, n_trajs_per_file=n_trajs_per_file, splits=list(splits)
+        )
+    else:
+        # Single file case
+        var_name = _infer_variable_name(data_path)
+        ds = ds_type(data_path, var_name)
+
+        n_samples_per_traj = ds.n_samples_per_traj
+        total_trajs = ds.N if n_trajs_per_file is None else min(n_trajs_per_file, ds.N)
+
+        n_train_traj = int(splits[0] * total_trajs)
+        n_val_traj = int(splits[1] * total_trajs)
+        n_test_traj = max(0, total_trajs - n_train_traj - n_val_traj)
+
+        n_train = n_train_traj * n_samples_per_traj
+        n_val = n_val_traj * n_samples_per_traj
+        n_test = n_test_traj * n_samples_per_traj
+
+        base_subset = ds if n_trajs_per_file is None else Subset(ds, range(total_trajs * n_samples_per_traj))
+
+        train_ds = Subset(base_subset, range(n_train))
+        val_ds = Subset(base_subset, range(n_train, n_train + n_val))
+        test_ds = Subset(base_subset, range(n_train + n_val, n_train + n_val + n_test))
+
+    if not return_loaders:
+        return train_ds, val_ds, test_ds
+
+    # Build DataLoaders (typical settings: shuffle for train only)
+    pw = persistent_workers if num_workers > 0 else False
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle,
+                              num_workers=num_workers, pin_memory=pin_memory,
+                              persistent_workers=pw)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=pin_memory,
+                            persistent_workers=pw)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers, pin_memory=pin_memory,
+                             persistent_workers=pw)
+
+    return train_loader, val_loader, test_loader
 
 
 
@@ -225,16 +311,53 @@ def close_all_datasets(dataset):
 
 
 if __name__ == '__main__':
+    import argparse
 
-    from tqdm import tqdm
-    from torch.utils.data import DataLoader
+    parser = argparse.ArgumentParser(description="Create train/val/test splits from a NetCDF dataset.")
+    parser.add_argument('--path', required=True, help='Path to a single .nc file or a directory containing .nc files')
+    parser.add_argument('--splits', type=float, nargs=3, default=(0.7, 0.2, 0.1),
+                        metavar=('TRAIN', 'VAL', 'TEST'), help='Split fractions (default: 0.7 0.2 0.1)')
+    parser.add_argument('--n-trajs', type=int, default=None, help='Limit to first N trajectories (optional)')
+    parser.add_argument('--batch-size', type=int, default=32, help='Batch size for DataLoaders')
+    parser.add_argument('--num-workers', type=int, default=0, help='Number of DataLoader workers')
+    parser.add_argument('--pin-memory', action='store_true', help='Enable pin_memory for DataLoaders')
+    parser.add_argument('--persistent-workers', action='store_true', help='Enable persistent_workers (requires num_workers>0)')
+    parser.add_argument('--datasets', action='store_true', help='Return Datasets instead of DataLoaders')
 
-    data_path = '/projects/artimis/PDEgym/CompressibleEuler/downstream/fulldata/CE-RM.nc'
-    ds = NetCDFTrajectoryDataset(data_path, variable_name='solution')
-    
-    print(ds[40][0].size(),len(ds))
+    args = parser.parse_args()
 
-    close_all_datasets(ds)
+    outputs = get_train_val_test_splits(
+        data_path=args.path,
+        ds_type=NetCDFTrajectoryDataset,
+        splits=tuple(args.splits),
+        n_trajs_per_file=args.n_trajs,
+        return_loaders=not args.datasets,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+    )
+
+    if args.datasets:
+        train_ds, val_ds, test_ds = outputs
+        print(f"Train samples: {len(train_ds)}")
+        print(f"Val samples:   {len(val_ds)}")
+        print(f"Test samples:  {len(test_ds)}")
+        # Ensure cleanup of open NetCDF files
+        close_all_datasets(train_ds)
+        close_all_datasets(val_ds)
+        close_all_datasets(test_ds)
+    else:
+        train_loader, val_loader, test_loader = outputs
+        print(f"Train samples: {len(train_loader.dataset)} | batches: {len(train_loader)}")
+        print(f"Val samples:   {len(val_loader.dataset)} | batches: {len(val_loader)}")
+        print(f"Test samples:  {len(test_loader.dataset)} | batches: {len(test_loader)}")
+        # Ensure cleanup of open NetCDF files
+        close_all_datasets(train_loader.dataset)
+        close_all_datasets(val_loader.dataset)
+        close_all_datasets(test_loader.dataset)
+
 
 
 
