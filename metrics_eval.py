@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from typing import Tuple, Dict, List, Any
 import numpy as np
+import torch
 
 from torch.utils.data import DataLoader
 
@@ -242,6 +243,137 @@ def evaluate_conservation_rewards_numpy(
         ds.close()
 
 
+# =============================
+# Power spectrum (radial) utils
+# =============================
+
+def _fft_freq_grids(H: int, W: int, device: torch.device, dtype: torch.dtype):
+    fx = torch.fft.fftfreq(H, d=1.0, device=device, dtype=dtype)
+    fy = torch.fft.fftfreq(W, d=1.0, device=device, dtype=dtype)
+    FX, FY = torch.meshgrid(fx, fy, indexing='ij')
+    R = torch.sqrt(FX * FX + FY * FY)
+    return FX, FY, R
+
+
+def _radial_average(P: torch.Tensor, R: torch.Tensor, rmax: float = 0.5, nbins: int = 64) -> torch.Tensor:
+    # P and R are HxW
+    H, W = P.shape
+    device = P.device
+    dtype = P.dtype
+
+    # Define bin edges [0, rmax] with nbins bins
+    edges = torch.linspace(0.0, rmax, steps=nbins + 1, device=device, dtype=dtype)
+
+    r_flat = R.reshape(-1)
+    p_flat = P.reshape(-1)
+
+    # Bin indices in 0..nbins-1
+    bin_idx = torch.bucketize(r_flat, edges, right=False) - 1
+    valid = (bin_idx >= 0) & (bin_idx < nbins)
+    bin_idx = bin_idx[valid]
+    p_valid = p_flat[valid]
+
+    # Accumulate sums and counts per bin
+    sums = torch.zeros(nbins, device=device, dtype=dtype)
+    counts = torch.zeros(nbins, device=device, dtype=dtype)
+    sums.scatter_add_(0, bin_idx, p_valid)
+    ones = torch.ones_like(p_valid)
+    counts.scatter_add_(0, bin_idx, ones)
+
+    # Avoid div by zero
+    counts = torch.clamp(counts, min=1.0)
+    return sums / counts
+
+
+def _log_radial_spectrum(x: torch.Tensor, nbins: int = 64, log_spectrum: bool = True) -> torch.Tensor:
+    H, W = x.shape
+    device = x.device
+    dtype = x.dtype
+    _, _, R = _fft_freq_grids(H, W, device, dtype)
+    X = torch.fft.fft2(x)
+    P = (X.real ** 2 + X.imag ** 2)
+    kspec = _radial_average(P, R, rmax=0.5, nbins=nbins)
+    return torch.log(kspec + 1e-20) if log_spectrum else kspec
+
+
+def evaluate_radial_power_spectra(
+    data_path: str,
+    *,
+    which_split: str = 'train',
+    splits: Tuple[float, float, float] = (0.7, 0.2, 0.1),
+    n_trajs: int | None = None,
+    require_T: int | None = 21,
+    nbins: int = 64,
+    log_spectrum: bool = True,
+    channel: int = 0,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Compute radial power spectra for the specified channel across timesteps and trajectories.
+
+    Returns:
+        (arr, meta) where arr has shape (Ntraj, T, nbins)
+    """
+    var_name = _infer_variable_name(data_path)
+    ds = NetCDFTrajectoryDataset(data_path, variable_name=var_name)
+
+    try:
+        N_traj = ds.N
+        T = ds.T
+        if (require_T is not None) and (T != require_T):
+            empty = np.zeros((0, 0, nbins), dtype=np.float32)
+            return empty, {
+                'split': which_split,
+                'n_traj_included': 0,
+                'T': T,
+                'reason': f"Dataset T={T} does not match require_T={require_T}",
+            }
+
+        # Determine split ranges by trajectory index
+        n_train = int(splits[0] * N_traj)
+        n_val = int(splits[1] * N_traj)
+        if which_split == 'train':
+            start, end = 0, n_train
+        elif which_split == 'val':
+            start, end = n_train, n_train + n_val
+        elif which_split == 'test':
+            start, end = n_train + n_val, N_traj
+        elif which_split == 'all':
+            start, end = 0, N_traj
+        else:
+            raise ValueError(f"Invalid which_split: {which_split}")
+
+        if n_trajs is not None:
+            end = min(end, start + max(0, n_trajs))
+
+        n_sel = max(0, end - start)
+        arr = np.zeros((n_sel, T, nbins), dtype=np.float32)
+
+        # Ensure underlying file is open for direct access
+        ds._ensure_open()
+        var = ds.ds[ds.variable_name]
+        # Iterate selected trajectories and all timesteps
+        write_idx = 0
+        for traj_idx in range(start, end):
+            for t in range(T):
+                # snapshot shape: (C, H, W)
+                snap = var[traj_idx, t]
+                xch = torch.as_tensor(snap[channel], dtype=torch.float32)
+                spec = _log_radial_spectrum(xch, nbins=nbins, log_spectrum=log_spectrum)
+                arr[write_idx, t, :] = spec.cpu().numpy()
+            write_idx += 1
+
+        meta: Dict[str, Any] = {
+            'split': which_split,
+            'n_traj_included': n_sel,
+            'T': T,
+            'nbins': nbins,
+            'channel': channel,
+        }
+        return arr, meta
+    finally:
+        ds.close()
+
+
 def plot_conservation_histograms(
     arr: np.ndarray,
     *,
@@ -320,6 +452,11 @@ def main():
     parser.add_argument('--save-npy', type=str, default=None, help='Path to save the (3,Ntraj,20) numpy file (optional)')
     parser.add_argument('--plot-npy', type=str, default=None, help='Path to a saved (3,Ntraj,20) numpy array to plot as histograms')
     parser.add_argument('--save-fig', type=str, default=None, help='If provided, save the histogram figure to this path (e.g., .png)')
+    parser.add_argument('--eval-ps', action='store_true', help='Evaluate radial power spectra for a channel over timesteps and trajectories')
+    parser.add_argument('--nbins', type=int, default=64, help='Number of radial bins for power spectrum (default: 64)')
+    parser.add_argument('--no-log-spectrum', action='store_true', help='Use linear spectrum instead of log(kspec+1e-20)')
+    parser.add_argument('--channel', type=int, default=0, help='Channel index for power spectrum (default: 0)')
+    parser.add_argument('--save-ps', type=str, default=None, help='Path to save power spectra array (Ntraj,T,nbins)')
 
     args = parser.parse_args()
 
@@ -369,6 +506,23 @@ def main():
 
     if args.plot_npy is not None:
         plot_conservation_histograms_from_file(args.plot_npy, save_path=args.save_fig)
+
+    if args.eval_ps:
+        arr_ps, meta_ps = evaluate_radial_power_spectra(
+            data_path=args.path,
+            which_split=args.split,
+            splits=tuple(args.splits),
+            n_trajs=args.n_trajs,
+            require_T=args.require_T,
+            nbins=args.nbins,
+            log_spectrum=(not args.no_log_spectrum),
+            channel=args.channel,
+        )
+        print(f"\nPower spectra shape: {arr_ps.shape} (expected (Ntraj, T, nbins))")
+        print(f"Included trajectories: {meta_ps['n_traj_included']} | T: {meta_ps['T']} | nbins: {meta_ps['nbins']} | channel: {meta_ps['channel']}")
+        out_ps = args.save_ps or f"power_spectra_{args.split}.npy"
+        np.save(out_ps, arr_ps)
+        print(f"Saved power spectra to: {out_ps}")
 
     # Ensure cleanup of open NetCDF files in loaders
     close_all_datasets(train_loader.dataset)
