@@ -66,57 +66,6 @@ def get_loaders(
     return train_loader, val_loader, test_loader
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Obtain train/val/test DataLoaders for NetCDF datasets.")
-    parser.add_argument('--path', default='/home/tpc-fkzzs/tpc26-2/data/PDEgym/CE-RP/CE-RP.nc', help='Path to a single .nc file or a directory containing .nc files')
-    parser.add_argument('--splits', type=float, nargs=3, default=(0.7, 0.2, 0.1),
-                        metavar=('TRAIN', 'VAL', 'TEST'), help='Split fractions (default: 0.7 0.2 0.1)')
-    parser.add_argument('--n-trajs', type=int, default=None, help='Limit to first N trajectories (optional)')
-    parser.add_argument('--batch-size', type=int, default=32, help='Batch size for DataLoaders')
-    parser.add_argument('--num-workers', type=int, default=0, help='Number of DataLoader workers')
-    parser.add_argument('--pin-memory', action='store_true', help='Enable pin_memory for DataLoaders')
-    parser.add_argument('--persistent-workers', action='store_true', help='Enable persistent_workers (requires num_workers>0)')
-    parser.add_argument('--eval-mass', action='store_true', help='Evaluate reward_massconservation per trajectory for (t, t+1) over selected split')
-    parser.add_argument('--split', type=str, default='train', choices=['train', 'val', 'test', 'all'], help='Which split to evaluate for reward metrics')
-
-    args = parser.parse_args()
-
-    # Always show DataLoader summary first
-    train_loader, val_loader, test_loader = get_loaders(
-        data_path=args.path,
-        splits=tuple(args.splits),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
-        persistent_workers=args.persistent_workers,
-        n_trajs=args.n_trajs,
-    )
-
-    print(f"Train samples: {len(train_loader.dataset)} | batches: {len(train_loader)}")
-    print(f"Val samples:   {len(val_loader.dataset)} | batches: {len(val_loader)}")
-    print(f"Test samples:  {len(test_loader.dataset)} | batches: {len(test_loader)}")
-
-    if args.eval_mass:
-        results = evaluate_massconservation_per_trajectory(
-            data_path=args.path,
-            which_split=args.split,
-            splits=tuple(args.splits),
-            n_trajs=args.n_trajs,
-        )
-        # Print concise summary: mean per trajectory
-        print(f"\nMass conservation reward per trajectory ({args.split} split):")
-        for r in results['results']:
-            print(f"traj {r['traj_index']}: mean={r['mean_reward']:.6f} (pairs={len(r['rewards'])})")
-
-    # Ensure cleanup of open NetCDF files in loaders
-    close_all_datasets(train_loader.dataset)
-    close_all_datasets(val_loader.dataset)
-    close_all_datasets(test_loader.dataset)
-
-
-if __name__ == "__main__":
-    main()
-
 def evaluate_massconservation_per_trajectory(
     data_path: str,
     *,
@@ -189,3 +138,55 @@ def evaluate_massconservation_per_trajectory(
     finally:
         # Ensure the NetCDF file is closed
         ds.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Obtain train/val/test DataLoaders for NetCDF datasets.")
+    parser.add_argument('--path', default='/home/tpc-fkzzs/tpc26-2/data/PDEgym/CE-RP/CE-RP.nc', help='Path to a single .nc file or a directory containing .nc files')
+    parser.add_argument('--splits', type=float, nargs=3, default=(0.7, 0.2, 0.1),
+                        metavar=('TRAIN', 'VAL', 'TEST'), help='Split fractions (default: 0.7 0.2 0.1)')
+    parser.add_argument('--n-trajs', type=int, default=None, help='Limit to first N trajectories (optional)')
+    parser.add_argument('--batch-size', type=int, default=32, help='Batch size for DataLoaders')
+    parser.add_argument('--num-workers', type=int, default=0, help='Number of DataLoader workers')
+    parser.add_argument('--pin-memory', action='store_true', help='Enable pin_memory for DataLoaders')
+    parser.add_argument('--persistent-workers', action='store_true', help='Enable persistent_workers (requires num_workers>0)')
+    parser.add_argument('--eval-mass', action='store_true', help='Evaluate reward_massconservation per trajectory for (t, t+1) over selected split')
+    parser.add_argument('--split', type=str, default='train', choices=['train', 'val', 'test', 'all'], help='Which split to evaluate for reward metrics')
+
+    args = parser.parse_args()
+
+    # Always show DataLoader summary first
+    train_loader, val_loader, test_loader = get_loaders(
+        data_path=args.path,
+        splits=tuple(args.splits),
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        n_trajs=args.n_trajs,
+    )
+
+    print(f"Train samples: {len(train_loader.dataset)} | batches: {len(train_loader)}")
+    print(f"Val samples:   {len(val_loader.dataset)} | batches: {len(val_loader)}")
+    print(f"Test samples:  {len(test_loader.dataset)} | batches: {len(test_loader)}")
+
+    if args.eval_mass:
+        results = evaluate_massconservation_per_trajectory(
+            data_path=args.path,
+            which_split=args.split,
+            splits=tuple(args.splits),
+            n_trajs=args.n_trajs,
+        )
+        # Print concise summary: mean per trajectory
+        print(f"\nMass conservation reward per trajectory ({args.split} split):")
+        for r in results['results']:
+            print(f"traj {r['traj_index']}: mean={r['mean_reward']:.6f} (pairs={len(r['rewards'])})")
+
+    # Ensure cleanup of open NetCDF files in loaders
+    close_all_datasets(train_loader.dataset)
+    close_all_datasets(val_loader.dataset)
+    close_all_datasets(test_loader.dataset)
+
+
+if __name__ == "__main__":
+    main()
