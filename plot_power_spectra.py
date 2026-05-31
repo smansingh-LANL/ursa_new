@@ -128,7 +128,8 @@ def plot_power_spectra_over_time(
     else:
         raise ValueError("k_scale must be one of: normalized, angular, mode")
 
-    cmap = plt.get_cmap("RdYlBu")  # 0->blue, 1->red, so invert by (1 - frac)
+    # Use a reversed colormap so earlier timesteps are red, later are blue via frac in [0,1]
+    cmap = plt.get_cmap("RdYlBu_r")
 
     # All subplots in one row as requested
     ncols = max(1, len(arr_list))
@@ -136,18 +137,29 @@ def plot_power_spectra_over_time(
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), constrained_layout=True)
     axes = np.atleast_1d(axes).reshape(nrows, ncols)
 
+    # For colorbar normalization across all subplots
+    T_max = max(cur.shape[0] for cur in arr_list)
+
     idx = 0
     for c in range(ncols):
         cur = arr_list[idx]
         T = cur.shape[0]
         for t in range(T):
             frac = t / max(1, (T - 1))
-            color = cmap(1.0 - frac)  # t=0 -> red, t=T-1 -> blue
+            color = cmap(frac)  # t=0 -> red, t=T-1 -> blue
             axes[0, c].plot(centers_plot, cur[t], color=color, linewidth=1.25)
         axes[0, c].set_xlabel(x_label)
         axes[0, c].set_ylabel("P(k)")
         axes[0, c].set_title(titles[idx])
         idx += 1
+
+    # Add a colorbar on the rightmost subplot to denote timestep mapping
+    from matplotlib.cm import ScalarMappable
+    norm_max = (T_max - 1) if T_max > 1 else 1
+    sm = ScalarMappable(norm=plt.Normalize(vmin=0, vmax=norm_max), cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes[0, -1])
+    cbar.set_label("Timestep (t)")
 
     if save_path is not None:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
