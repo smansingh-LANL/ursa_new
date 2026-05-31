@@ -257,6 +257,8 @@ def main():
     parser.add_argument('--eval-all', action='store_true', help='Evaluate mass, momentum, energy for trajectories with full T and save as (3,Ntraj,20) numpy array')
     parser.add_argument('--require-T', type=int, default=21, help='Only include trajectories from files with exactly this many timesteps (default: 21)')
     parser.add_argument('--save-npy', type=str, default=None, help='Path to save the (3,Ntraj,20) numpy file (optional)')
+    parser.add_argument('--plot-npy', type=str, default=None, help='Path to a saved (3,Ntraj,20) numpy array to plot as histograms')
+    parser.add_argument('--save-fig', type=str, default=None, help='If provided, save the histogram figure to this path (e.g., .png)')
 
     args = parser.parse_args()
 
@@ -304,6 +306,9 @@ def main():
         np.save(out_path, arr)
         print(f"Saved numpy array to: {out_path}")
 
+    if args.plot_npy is not None:
+        plot_conservation_histograms_from_file(args.plot_npy, save_path=args.save_fig)
+
     # Ensure cleanup of open NetCDF files in loaders
     close_all_datasets(train_loader.dataset)
     close_all_datasets(val_loader.dataset)
@@ -312,3 +317,63 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def plot_conservation_histograms(
+    arr: np.ndarray,
+    *,
+    bins: int = 50,
+    density: bool = True,
+    figsize: Tuple[float, float] = (12, 4),
+    save_path: str | None = None,
+) -> None:
+    """
+    Plot three histograms (mass, momentum, energy) from an array shaped (3, Ntraj, T-1).
+
+    Args:
+        arr: numpy array with shape (3, Ntraj, T-1)
+        bins: number of histogram bins
+        density: whether to normalize the histogram to form a probability density
+        figsize: figure size
+        save_path: if provided, save figure to this path; otherwise show interactively
+    """
+    # Lazy import to avoid hard dependency at import time
+    import matplotlib.pyplot as plt
+
+    if arr.ndim != 3 or arr.shape[0] != 3:
+        raise ValueError(f"Expected arr shape (3, Ntraj, T-1); got {arr.shape}")
+
+    labels = [
+        ("Mass Conservation", "P(x)"),
+        ("Momentum Conservation", "P(x)"),
+        ("Energy Conservation", "P(x)"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
+
+    for i, ax in enumerate(axes):
+        data = arr[i].reshape(-1)  # flatten across trajectories and time pairs
+        ax.hist(data, bins=bins, density=density, alpha=0.8, color='#1f77b4', edgecolor='black')
+        ax.set_xlabel(labels[i][0])
+        ax.set_ylabel(labels[i][1])
+        ax.set_title(labels[i][0])
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+    else:
+        plt.show()
+
+
+def plot_conservation_histograms_from_file(
+    npy_path: str,
+    *,
+    bins: int = 50,
+    density: bool = True,
+    figsize: Tuple[float, float] = (12, 4),
+    save_path: str | None = None,
+) -> None:
+    """
+    Convenience wrapper to load a saved (3, Ntraj, T-1) .npy array and plot histograms.
+    """
+    arr = np.load(npy_path)
+    plot_conservation_histograms(arr, bins=bins, density=density, figsize=figsize, save_path=save_path)
