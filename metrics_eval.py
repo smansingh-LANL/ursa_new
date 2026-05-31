@@ -23,8 +23,8 @@ from dataloader import (
     NetCDFTrajectoryDataset,
     close_all_datasets,
 )
-from .dataloader import _infer_variable_name
-from .physics_rewards import reward_massconservation
+from dataloader import _infer_variable_name
+from physics_rewards import reward_massconservation
 
 
 def get_loaders(
