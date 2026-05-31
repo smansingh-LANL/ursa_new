@@ -33,6 +33,26 @@ from physics_rewards import (
 )
 
 
+# =====================
+# Device/helper utilities
+# =====================
+
+def _resolve_device(device_str: Optional[str]) -> torch.device:
+    if device_str is not None:
+        return torch.device(device_str)
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    # Add MPS if desired; on Windows it's not typical. Fallback to CPU.
+    return torch.device('cpu')
+
+
+def _to_device_numpy(arr_np: np.ndarray, device: torch.device) -> torch.Tensor:
+    t = torch.from_numpy(arr_np).contiguous()
+    if device.type == 'cuda':
+        return t.pin_memory().to(device, non_blocking=True).to(torch.float32)
+    return t.to(device=device, dtype=torch.float32)
+
+
 def get_loaders(
     data_path: str,
     *,
@@ -311,6 +331,7 @@ def evaluate_radial_power_spectra(
     nbins: int = 64,
     log_spectrum: bool = True,
     channel: int = 0,
+    all_channels: bool = False,
     device: Optional[str] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
@@ -326,8 +347,9 @@ def evaluate_radial_power_spectra(
     try:
         N_traj = ds.N
         T = ds.T
+        C = ds.C
         if (require_T is not None) and (T != require_T):
-            empty = np.zeros((0, 0, nbins), dtype=np.float32)
+            empty = np.zeros(((C if all_channels else 0), 0, 0, nbins) if all_channels else (0, 0, nbins), dtype=np.float32)
             return empty, {
                 'split': which_split,
                 'n_traj_included': 0,
@@ -353,7 +375,10 @@ def evaluate_radial_power_spectra(
             end = min(end, start + max(0, n_trajs))
 
         n_sel = max(0, end - start)
-        arr_t = torch.zeros((n_sel, T, nbins), dtype=torch.float32, device=dev)
+        if all_channels:
+            arr_t = torch.zeros((C, n_sel, T, nbins), dtype=torch.float32, device=dev)
+        else:
+            arr_t = torch.zeros((n_sel, T, nbins), dtype=torch.float32, device=dev)
 
         # Ensure underlying file is open for direct access
         ds._ensure_open()
@@ -364,14 +389,25 @@ def evaluate_radial_power_spectra(
             for t in range(T):
                 # snapshot shape: (C, H, W)
                 snap = var[traj_idx, t]
-                xch_cpu = torch.from_numpy(snap[channel]).contiguous()
-                if dev.type == 'cuda':
-                    xch = xch_cpu.pin_memory().to(dev, non_blocking=True)
+                if all_channels:
+                    for c in range(C):
+                        xch_cpu = torch.from_numpy(snap[c]).contiguous()
+                        if dev.type == 'cuda':
+                            xch = xch_cpu.pin_memory().to(dev, non_blocking=True)
+                        else:
+                            xch = xch_cpu.to(dev)
+                        xch = xch.to(torch.float32)
+                        spec = _log_radial_spectrum(xch, nbins=nbins, log_spectrum=log_spectrum)
+                        arr_t[c, write_idx, t, :] = spec
                 else:
-                    xch = xch_cpu.to(dev)
-                xch = xch.to(torch.float32)
-                spec = _log_radial_spectrum(xch, nbins=nbins, log_spectrum=log_spectrum)
-                arr_t[write_idx, t, :] = spec
+                    xch_cpu = torch.from_numpy(snap[channel]).contiguous()
+                    if dev.type == 'cuda':
+                        xch = xch_cpu.pin_memory().to(dev, non_blocking=True)
+                    else:
+                        xch = xch_cpu.to(dev)
+                    xch = xch.to(torch.float32)
+                    spec = _log_radial_spectrum(xch, nbins=nbins, log_spectrum=log_spectrum)
+                    arr_t[write_idx, t, :] = spec
             write_idx += 1
 
         meta: Dict[str, Any] = {
@@ -379,9 +415,15 @@ def evaluate_radial_power_spectra(
             'n_traj_included': n_sel,
             'T': T,
             'nbins': nbins,
-            'channel': channel,
+            'C': C,
+            'channel': (None if all_channels else channel),
         }
-        return arr_t.detach().cpu().numpy(), meta
+        arr_np = arr_t.detach().cpu().numpy()
+        if all_channels:
+            # Ensure output order (C, Ntraj, T, nbins)
+            return arr_np, meta
+        else:
+            return arr_np, meta
     finally:
         ds.close()
 
@@ -468,6 +510,7 @@ def main():
     parser.add_argument('--nbins', type=int, default=64, help='Number of radial bins for power spectrum (default: 64)')
     parser.add_argument('--no-log-spectrum', action='store_true', help='Use linear spectrum instead of log(kspec+1e-20)')
     parser.add_argument('--channel', type=int, default=0, help='Channel index for power spectrum (default: 0)')
+    parser.add_argument('--all-channels', action='store_true', help='Compute spectra for all channels and save (C,Ntraj,T,nbins)')
     parser.add_argument('--save-ps', type=str, default=None, help='Path to save power spectra array (Ntraj,T,nbins)')
     parser.add_argument('--device', type=str, default=None, help='Torch device to use (e.g., cuda, cuda:0, cpu). Defaults to CUDA if available.')
     parser.add_argument('--amp', action='store_true', help='Enable torch.cuda.amp.autocast for power spectra (experimental)')
@@ -532,11 +575,14 @@ def main():
             nbins=args.nbins,
             log_spectrum=(not args.no_log_spectrum),
             channel=args.channel,
+            all_channels=args.all_channels,
             device=args.device,
         )
-        print(f"\nPower spectra shape: {arr_ps.shape} (expected (Ntraj, T, nbins))")
-        print(f"Included trajectories: {meta_ps['n_traj_included']} | T: {meta_ps['T']} | nbins: {meta_ps['nbins']} | channel: {meta_ps['channel']}")
-        out_ps = args.save_ps or f"power_spectra_{args.split}.npy"
+        expected = "(C, Ntraj, T, nbins)" if args.all_channels else "(Ntraj, T, nbins)"
+        print(f"\nPower spectra shape: {arr_ps.shape} (expected {expected})")
+        print(f"Included trajectories: {meta_ps['n_traj_included']} | T: {meta_ps['T']} | nbins: {meta_ps['nbins']} | C: {meta_ps['C']} | channel: {meta_ps['channel']}")
+        default_name = f"power_spectra_{args.split}_allch.npy" if args.all_channels else f"power_spectra_{args.split}.npy"
+        out_ps = args.save_ps or default_name
         np.save(out_ps, arr_ps)
         print(f"Saved power spectra to: {out_ps}")
 
@@ -548,23 +594,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# =====================
-# Device/helper utilities
-# =====================
-
-def _resolve_device(device_str: Optional[str]) -> torch.device:
-    if device_str is not None:
-        return torch.device(device_str)
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    # Add MPS if desired; on Windows it's not typical. Fallback to CPU.
-    return torch.device('cpu')
-
-
-def _to_device_numpy(arr_np: np.ndarray, device: torch.device) -> torch.Tensor:
-    t = torch.from_numpy(arr_np).contiguous()
-    if device.type == 'cuda':
-        return t.pin_memory().to(device, non_blocking=True).to(torch.float32)
-    return t.to(device=device, dtype=torch.float32)

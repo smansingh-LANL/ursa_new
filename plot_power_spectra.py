@@ -56,12 +56,20 @@ def aggregate_over_trajectories(arr: np.ndarray, method: str = "mean") -> np.nda
     Returns:
         (T, nbins)
     """
-    if arr.ndim != 3:
-        raise ValueError(f"Expected input array with shape (Ntraj, T, nbins); got {arr.shape}")
-    if method == "mean":
-        return arr.mean(axis=0)
-    if method == "median":
-        return np.median(arr, axis=0)
+    if arr.ndim == 3:
+        # (Ntraj, T, nbins) -> (T, nbins)
+        if method == "mean":
+            return arr.mean(axis=0)
+        if method == "median":
+            return np.median(arr, axis=0)
+    elif arr.ndim == 4:
+        # (C, Ntraj, T, nbins) -> (C, T, nbins)
+        if method == "mean":
+            return arr.mean(axis=1)
+        if method == "median":
+            return np.median(arr, axis=1)
+    else:
+        raise ValueError(f"Expected input array with shape (Ntraj, T, nbins) or (C, Ntraj, T, nbins); got {arr.shape}")
     raise ValueError("method must be 'mean' or 'median'")
 
 
@@ -85,8 +93,16 @@ def plot_power_spectra_over_time(
     """
     import matplotlib.pyplot as plt
 
-    if arr_T_nb.ndim != 2:
-        raise ValueError(f"Expected (T, nbins); got {arr_T_nb.shape}")
+    if arr_T_nb.ndim == 2:
+        # Single channel case: (T, nbins)
+        arr_list = [arr_T_nb]
+        titles = [title]
+    elif arr_T_nb.ndim == 3:
+        # Multi-channel aggregated case: (C, T, nbins)
+        arr_list = [arr_T_nb[c] for c in range(arr_T_nb.shape[0])]
+        titles = [f"{title} (ch={c})" for c in range(arr_T_nb.shape[0])]
+    else:
+        raise ValueError(f"Expected (T, nbins) or (C, T, nbins); got {arr_T_nb.shape}")
 
     T, nbins = arr_T_nb.shape
     # Reconstruct bin centers to use as x-axis (consistent with metrics_eval rmax=0.5)
@@ -96,16 +112,27 @@ def plot_power_spectra_over_time(
     cmap = plt.get_cmap("RdYlBu")  # 0->blue, 1->red, so invert by (1 - frac)
     eps = 1e-9
 
-    fig, ax = plt.subplots(figsize=(7.5, 5))
-    for t in range(T):
-        frac = t / max(1, (T - 1))
-        color = cmap(1.0 - frac)  # t=0 -> red, t=T-1 -> blue
-        ax.plot(centers, arr_T_nb[t], color=color, linewidth=1.25)
+    ncols = min(3, len(arr_list))
+    nrows = int(np.ceil(len(arr_list) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6*ncols, 4*nrows), constrained_layout=True)
+    axes = np.atleast_1d(axes).reshape(nrows, ncols)
 
-    ax.set_xlabel("k (radial frequency)")
-    ax.set_ylabel("P(k)")
-    ax.set_title(title)
-    # No legend requested
+    idx = 0
+    for r in range(nrows):
+        for c in range(ncols):
+            if idx >= len(arr_list):
+                axes[r, c].axis('off')
+                continue
+            cur = arr_list[idx]
+            T = cur.shape[0]
+            for t in range(T):
+                frac = t / max(1, (T - 1))
+                color = cmap(1.0 - frac)  # t=0 -> red, t=T-1 -> blue
+                axes[r, c].plot(centers, cur[t], color=color, linewidth=1.25)
+            axes[r, c].set_xlabel("k (radial frequency)")
+            axes[r, c].set_ylabel("P(k)")
+            axes[r, c].set_title(titles[idx])
+            idx += 1
 
     if save_path is not None:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -116,7 +143,7 @@ def plot_power_spectra_over_time(
 
 def main():
     parser = argparse.ArgumentParser(description="Plot aggregated radial power spectra over time.")
-    parser.add_argument("--path", required=True, help="Path to .npz or .npy file with (Ntraj, T, nbins) array")
+    parser.add_argument("--path", required=True, help="Path to .npz or .npy file with (Ntraj, T, nbins) or (C, Ntraj, T, nbins)")
     parser.add_argument("--aggregate", choices=["mean", "median"], default="mean", help="Aggregation across trajectories (default: mean)")
     parser.add_argument("--rmax", type=float, default=0.5, help="Radial max used during binning (default: 0.5)")
     parser.add_argument("--save-fig", type=str, default=None, help="If provided, save figure to this path (e.g., .png)")
@@ -126,12 +153,13 @@ def main():
     args = parser.parse_args()
 
     arr = _load_power_spectra(args.path)
-    if arr.ndim != 3:
-        raise ValueError(f"Expected (Ntraj, T, nbins); got {arr.shape}")
+    if arr.ndim not in (3, 4):
+        raise ValueError(f"Expected (Ntraj, T, nbins) or (C, Ntraj, T, nbins); got {arr.shape}")
 
-    arr_T_nb = aggregate_over_trajectories(arr, method=args.aggregate)
+    agg = aggregate_over_trajectories(arr, method=args.aggregate)
+    # agg: (T, nbins) if 3D input; (C, T, nbins) if 4D input
     plot_power_spectra_over_time(
-        arr_T_nb,
+        agg,
         rmax=args.rmax,
         save_path=args.save_fig,
         show=(not args.no_show),
