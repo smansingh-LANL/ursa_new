@@ -18,7 +18,7 @@ from typing import Tuple
 
 from torch.utils.data import DataLoader
 
-from .dataloader import (
+from dataloader import (
     get_train_val_test_splits,
     NetCDFTrajectoryDataset,
     close_all_datasets,
@@ -66,7 +66,7 @@ def get_loaders(
 
 def main():
     parser = argparse.ArgumentParser(description="Obtain train/val/test DataLoaders for NetCDF datasets.")
-    parser.add_argument('--path', required=True, help='Path to a single .nc file or a directory containing .nc files')
+    parser.add_argument('--path',default='/home/tpc-fkzzs/tpc26-2/data/PDEgym/CE-RP/CE-RP.nc', help='Path to a single .nc file or a directory containing .nc files')
     parser.add_argument('--splits', type=float, nargs=3, default=(0.7, 0.2, 0.1),
                         metavar=('TRAIN', 'VAL', 'TEST'), help='Split fractions (default: 0.7 0.2 0.1)')
     parser.add_argument('--n-trajs', type=int, default=None, help='Limit to first N trajectories (optional)')
