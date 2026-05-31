@@ -104,8 +104,8 @@ def plot_power_spectra_over_time(
     else:
         raise ValueError(f"Expected (T, nbins) or (C, T, nbins); got {arr_T_nb.shape}")
 
-    T, nbins = arr_T_nb.shape
-    # Reconstruct bin centers to use as x-axis (consistent with metrics_eval rmax=0.5)
+    # Determine nbins from the first entry and build bin centers
+    T0, nbins = arr_list[0].shape
     edges = np.linspace(0.0, rmax, nbins + 1, dtype=np.float32)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
