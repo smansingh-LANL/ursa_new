@@ -14,7 +14,7 @@ infers the correct NetCDF variable name from the file name patterns.
 from __future__ import annotations
 
 import argparse
-from typing import Tuple, Dict, List, Any
+from typing import Tuple, Dict, List, Any, Optional
 import numpy as np
 import torch
 
@@ -153,6 +153,7 @@ def evaluate_conservation_rewards_numpy(
     splits: Tuple[float, float, float] = (0.7, 0.2, 0.1),
     n_trajs: int | None = None,
     require_T: int = 21,
+    device: Optional[str] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Evaluate mass, momentum, and energy conservation rewards for qualifying trajectories
@@ -163,6 +164,7 @@ def evaluate_conservation_rewards_numpy(
         (arr, meta) where arr has shape (3, Ntraj, T-1) ordered as [mass, momentum, energy]
         and meta contains basic metadata such as counts and indices.
     """
+    dev = _resolve_device(device)
     var_name = _infer_variable_name(data_path)
     ds = NetCDFTrajectoryDataset(data_path, variable_name=var_name)
 
@@ -198,39 +200,35 @@ def evaluate_conservation_rewards_numpy(
         if n_trajs is not None:
             end = min(end, start + max(0, n_trajs))
 
-        mass_all: List[List[float]] = []
-        mom_all: List[List[float]] = []
-        en_all: List[List[float]] = []
         included_indices: List[int] = []
+        n_sel = max(0, end - start)
+        rewards_t = torch.zeros((3, n_sel, T_pairs), dtype=torch.float32, device=dev)
 
+        # Work from raw dataset to avoid Python-level __getitem__ and move directly to device
+        ds._ensure_open()
+        var = ds.ds[ds.variable_name]
+
+        write_idx = 0
         for traj_idx in range(start, end):
-            base = traj_idx * T_pairs
-            mass_vals: List[float] = []
-            mom_vals: List[float] = []
-            en_vals: List[float] = []
             for t in range(T_pairs):
-                idx = base + t
-                x, y = ds[idx]
+                # x_t and y_{t+1}
+                snap_x = var[traj_idx, t]
+                snap_y = var[traj_idx, t + 1]
+                x = _to_device_numpy(snap_x, dev)  # shape (C, H, W)
+                y = _to_device_numpy(snap_y, dev)
+
                 r_mass = reward_massconservation(x, y)
                 r_mom = reward_momentumconservation(x, y)
                 r_en = reward_energyconservation(y, x)  # note reversed args
-                mass_vals.append(float(r_mass.item()))
-                mom_vals.append(float(r_mom.item()))
-                en_vals.append(float(r_en.item()))
 
-            mass_all.append(mass_vals)
-            mom_all.append(mom_vals)
-            en_all.append(en_vals)
+                rewards_t[0, write_idx, t] = r_mass
+                rewards_t[1, write_idx, t] = r_mom
+                rewards_t[2, write_idx, t] = r_en
+
             included_indices.append(traj_idx)
+            write_idx += 1
 
-        if len(included_indices) == 0:
-            arr = np.zeros((3, 0, T_pairs), dtype=np.float32)
-        else:
-            arr = np.stack([
-                np.array(mass_all, dtype=np.float32),
-                np.array(mom_all, dtype=np.float32),
-                np.array(en_all, dtype=np.float32),
-            ], axis=0)  # (3, Ntraj, T_pairs)
+        arr = rewards_t.detach().cpu().numpy()  # (3, Ntraj, T_pairs)
 
         meta: Dict[str, Any] = {
             'split': which_split,
@@ -246,6 +244,9 @@ def evaluate_conservation_rewards_numpy(
 # =============================
 # Power spectrum (radial) utils
 # =============================
+
+_R_CACHE: Dict[Tuple[int, int, str, str], torch.Tensor] = {}
+
 
 def _fft_freq_grids(H: int, W: int, device: torch.device, dtype: torch.dtype):
     fx = torch.fft.fftfreq(H, d=1.0, device=device, dtype=dtype)
@@ -289,7 +290,11 @@ def _log_radial_spectrum(x: torch.Tensor, nbins: int = 64, log_spectrum: bool = 
     H, W = x.shape
     device = x.device
     dtype = x.dtype
-    _, _, R = _fft_freq_grids(H, W, device, dtype)
+    key = (H, W, str(device), str(dtype))
+    R = _R_CACHE.get(key)
+    if R is None:
+        _, _, R = _fft_freq_grids(H, W, device, dtype)
+        _R_CACHE[key] = R
     X = torch.fft.fft2(x)
     P = (X.real ** 2 + X.imag ** 2)
     kspec = _radial_average(P, R, rmax=0.5, nbins=nbins)
@@ -306,6 +311,7 @@ def evaluate_radial_power_spectra(
     nbins: int = 64,
     log_spectrum: bool = True,
     channel: int = 0,
+    device: Optional[str] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Compute radial power spectra for the specified channel across timesteps and trajectories.
@@ -313,6 +319,7 @@ def evaluate_radial_power_spectra(
     Returns:
         (arr, meta) where arr has shape (Ntraj, T, nbins)
     """
+    dev = _resolve_device(device)
     var_name = _infer_variable_name(data_path)
     ds = NetCDFTrajectoryDataset(data_path, variable_name=var_name)
 
@@ -346,7 +353,7 @@ def evaluate_radial_power_spectra(
             end = min(end, start + max(0, n_trajs))
 
         n_sel = max(0, end - start)
-        arr = np.zeros((n_sel, T, nbins), dtype=np.float32)
+        arr_t = torch.zeros((n_sel, T, nbins), dtype=torch.float32, device=dev)
 
         # Ensure underlying file is open for direct access
         ds._ensure_open()
@@ -357,9 +364,14 @@ def evaluate_radial_power_spectra(
             for t in range(T):
                 # snapshot shape: (C, H, W)
                 snap = var[traj_idx, t]
-                xch = torch.as_tensor(snap[channel], dtype=torch.float32)
+                xch_cpu = torch.from_numpy(snap[channel]).contiguous()
+                if dev.type == 'cuda':
+                    xch = xch_cpu.pin_memory().to(dev, non_blocking=True)
+                else:
+                    xch = xch_cpu.to(dev)
+                xch = xch.to(torch.float32)
                 spec = _log_radial_spectrum(xch, nbins=nbins, log_spectrum=log_spectrum)
-                arr[write_idx, t, :] = spec.cpu().numpy()
+                arr_t[write_idx, t, :] = spec
             write_idx += 1
 
         meta: Dict[str, Any] = {
@@ -369,7 +381,7 @@ def evaluate_radial_power_spectra(
             'nbins': nbins,
             'channel': channel,
         }
-        return arr, meta
+        return arr_t.detach().cpu().numpy(), meta
     finally:
         ds.close()
 
@@ -457,6 +469,8 @@ def main():
     parser.add_argument('--no-log-spectrum', action='store_true', help='Use linear spectrum instead of log(kspec+1e-20)')
     parser.add_argument('--channel', type=int, default=0, help='Channel index for power spectrum (default: 0)')
     parser.add_argument('--save-ps', type=str, default=None, help='Path to save power spectra array (Ntraj,T,nbins)')
+    parser.add_argument('--device', type=str, default=None, help='Torch device to use (e.g., cuda, cuda:0, cpu). Defaults to CUDA if available.')
+    parser.add_argument('--amp', action='store_true', help='Enable torch.cuda.amp.autocast for power spectra (experimental)')
 
     args = parser.parse_args()
 
@@ -494,6 +508,7 @@ def main():
             splits=tuple(args.splits),
             n_trajs=args.n_trajs,
             require_T=args.require_T,
+            device=args.device,
         )
         print(f"\nAll conservation rewards array shape: {arr.shape} (expected (3, Ntraj, 20))")
         print(f"Included trajectories: {meta['n_traj_included']} | pairs per traj: {meta['pairs_per_traj']}")
@@ -517,6 +532,7 @@ def main():
             nbins=args.nbins,
             log_spectrum=(not args.no_log_spectrum),
             channel=args.channel,
+            device=args.device,
         )
         print(f"\nPower spectra shape: {arr_ps.shape} (expected (Ntraj, T, nbins))")
         print(f"Included trajectories: {meta_ps['n_traj_included']} | T: {meta_ps['T']} | nbins: {meta_ps['nbins']} | channel: {meta_ps['channel']}")
@@ -532,3 +548,23 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# =====================
+# Device/helper utilities
+# =====================
+
+def _resolve_device(device_str: Optional[str]) -> torch.device:
+    if device_str is not None:
+        return torch.device(device_str)
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    # Add MPS if desired; on Windows it's not typical. Fallback to CPU.
+    return torch.device('cpu')
+
+
+def _to_device_numpy(arr_np: np.ndarray, device: torch.device) -> torch.Tensor:
+    t = torch.from_numpy(arr_np).contiguous()
+    if device.type == 'cuda':
+        return t.pin_memory().to(device, non_blocking=True).to(torch.float32)
+    return t.to(device=device, dtype=torch.float32)
